@@ -11,6 +11,19 @@
 #include "activities/UiTabListActivity.h"
 #include "components/OptionPopup.h"
 
+// Cover view: the shelf as a 3x2 grid of book covers, toggled from the header.
+// X4 Pro only for now (touch + PSRAM for the cover snapshots); every other
+// board compiles it out.
+#if FREEINK_DEVICE_X4PRO
+#define LIBRARY_COVER_VIEW 1
+#include <array>
+#include <atomic>
+
+#include "components/HomeCoverCache.h"
+#else
+#define LIBRARY_COVER_VIEW 0
+#endif
+
 // One Library screen: every indexed book on the card shown by recency, title,
 // or author. The Recent shelf orders by file modification time (when a book
 // landed on the card) and pins the recently OPENED books from RecentBooksStore
@@ -43,7 +56,9 @@ class LibraryListActivity final : public UiTabListActivity {
   void activateIndex(int index) override;
   void onRowLongPress(int index) override;
 #if FREEINK_CAP_TOUCH
-  bool canSwipeDelete(int index) const override { return !groupsCollapsed && index >= 0 && index < listCount(); }
+  bool canSwipeDelete(int index) const override {
+    return !groupsCollapsed && !coverView() && index >= 0 && index < listCount();
+  }
   void swipeDelete(int index) override;
 #endif
   int tabCount() const override;
@@ -67,6 +82,29 @@ class LibraryListActivity final : public UiTabListActivity {
   static constexpr freeink::ui::ActionId ACTION_SEARCH = ACTION_TAB_USER;
   static constexpr freeink::ui::ActionId ACTION_REBUILD = ACTION_SEARCH + 1;
   static constexpr freeink::ui::ActionId ACTION_BACK = ACTION_REBUILD + 1;
+  static constexpr freeink::ui::ActionId ACTION_TOGGLE_VIEW = ACTION_BACK + 1;
+
+  // True while the shelf draws as a cover grid (always false without the view).
+  bool coverView() const;
+#if LIBRARY_COVER_VIEW
+  static constexpr int GRID_COLUMNS = 3;
+  static constexpr int GRID_MAX_CELLS = 6;  // 3 x 2
+  void toggleCoverView();
+  static void toggleViewActionTrampoline(const freeink::ui::ActionEvent& event, void* user);
+  void buildCoverGrid(UiScreen& screen);
+  // Re-reads the visible page's books; a slot whose book changed gets a fresh
+  // thumb path and loses its cached snapshot.
+  void refreshCoverSlots(int top, int cells);
+  bool paintCover(freeink::ui::DrawTarget& target, freeink::ui::Rect rect, uint16_t index);
+  // Makes the thumbs the page is missing, behind a Loading popup. Runs in the
+  // render task after the page was shown with placeholders.
+  void generateMissingCovers();
+  bool coverFailed(const std::string& path) const;
+  // Grid swipes move whole pages; the list's viewport scroll does not apply.
+  bool handleCoverSwipe();
+#endif
+  // Path of the book behind one entry (pinned store row or index row).
+  bool bookPathFor(int entry, std::string& path);
 
   // Walk the card and write a fresh index. Blocking, with a popup: at ~70 books
   // it is well under a second, and it only runs when the index is missing or the
@@ -196,4 +234,26 @@ class LibraryListActivity final : public UiTabListActivity {
   // Row options modal (Recent long-press menu); owned here so it outlives the
   // touch event that opened it.
   OptionPopup optionPopup;
+
+#if LIBRARY_COVER_VIEW
+  // One visible cell of the cover grid. Only the shown page is materialized.
+  struct CoverSlot {
+    std::string bookPath;
+    std::string thumbPath;  // empty for formats without a cover
+    std::string title;
+    bool missing = false;  // thumbPath does not exist yet
+    bool failed = false;   // the cover could not be made; draw the placeholder
+  };
+  std::array<CoverSlot, GRID_MAX_CELLS> coverSlots;
+  HomeCoverCache coverCache;
+  bool coverCacheReady = false;
+  int coverSlotsTop = -1;
+  int coverSlotsCount = 0;
+  int coverThumbHeight = 0;
+  // First entry of the page on screen, for swipes from the input task.
+  std::atomic<int> gridTopShown{0};
+  // Books whose cover could not be made, so a page does not retry them on
+  // every visit. Hashes of the path; bounded.
+  std::vector<size_t> failedCovers;
+#endif
 };

@@ -13,6 +13,13 @@
 
 #include <algorithm>
 #include <cstdio>
+#if LIBRARY_COVER_VIEW
+#include <Epub.h>
+#include <FsHelpers.h>
+#include <Xtc.h>
+
+#include <functional>
+#endif
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
@@ -74,7 +81,12 @@ const char* tabLabelFor(const int tab) {
 }  // namespace
 
 LibraryListActivity::LibraryListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
-    : UiTabListActivity("Library", renderer, mappedInput, true) {
+    : UiTabListActivity("Library", renderer, mappedInput, true)
+#if LIBRARY_COVER_VIEW
+      ,
+      coverCache(renderer)
+#endif
+{
   // Three short tab labels: a full-slot pill would stretch across a third of
   // the screen, so cap it at the label plus padding (slots stay put).
   tabPillMaxPad = 16;
@@ -91,6 +103,10 @@ void LibraryListActivity::onEnter() {
   app.on(ACTION_SEARCH, &LibraryListActivity::searchActionTrampoline, this);
   app.on(ACTION_REBUILD, &LibraryListActivity::rebuildActionTrampoline, this);
   app.on(ACTION_BACK, &LibraryListActivity::backActionTrampoline, this);
+#if LIBRARY_COVER_VIEW
+  app.on(ACTION_TOGGLE_VIEW, &LibraryListActivity::toggleViewActionTrampoline, this);
+  coverSlotsTop = -1;
+#endif
 
   // Recent is backed by the resident store. Prune before opening the index so
   // its persistence write never overlaps the long-lived index reader.
@@ -213,23 +229,29 @@ void LibraryListActivity::refreshOverlap() {
   std::sort(overlapRows, overlapRows + overlapCount);
 }
 
+bool LibraryListActivity::bookPathFor(const int entry, std::string& path) {
+  path.clear();
+  if (entry < pinnedCount()) {
+    const RecentBook* book = storeBook(entry);
+    if (!book) return false;
+    path = book->path;
+    return true;
+  }
+  if (!index.isOpen()) return false;
+  const uint16_t ordinal = index.ordinalForRow(sortOrder, static_cast<uint16_t>(rowFor(entry)));
+  if (ordinal == 0xFFFF) return false;
+
+  library::ClixRecord record{};
+  if (!index.readRecord(ordinal, record) || !index.readPath(record, path)) {
+    LOG_ERR("LIB", "cannot resolve path for row %d", entry);
+    return false;
+  }
+  return true;
+}
+
 void LibraryListActivity::openSelectedBook() {
   std::string path;
-  if (selectedEntry() < pinnedCount()) {
-    const RecentBook* book = storeBook(selectedEntry());
-    if (!book) return;
-    path = book->path;
-  } else {
-    if (!index.isOpen()) return;
-    const uint16_t ordinal = index.ordinalForRow(sortOrder, static_cast<uint16_t>(rowFor(selectedEntry())));
-    if (ordinal == 0xFFFF) return;
-
-    library::ClixRecord record{};
-    if (!index.readRecord(ordinal, record) || !index.readPath(record, path)) {
-      LOG_ERR("LIB", "cannot resolve path for row %d", selectedEntry());
-      return;
-    }
-  }
+  if (!bookPathFor(selectedEntry(), path)) return;
   openBookByPath(path);
 }
 
@@ -552,7 +574,10 @@ int LibraryListActivity::rowFor(const int entry) const {
   return row;
 }
 
-bool LibraryListActivity::groupable() const { return !degraded && !isRecentSort(sortOrder) && bookRowCount() > 0; }
+// The cover grid is a flat shelf: long-press deletes there instead of grouping.
+bool LibraryListActivity::groupable() const {
+  return !degraded && !coverView() && !isRecentSort(sortOrder) && bookRowCount() > 0;
+}
 
 uint32_t LibraryListActivity::titleInitialFor(const int entry) {
   const uint16_t ordinal = index.ordinalForRow(sortOrder, static_cast<uint16_t>(rowFor(entry)));
@@ -760,6 +785,9 @@ bool LibraryListActivity::handleCustomInput() {
     lockNextBackRelease = false;
     return true;
   }
+#if LIBRARY_COVER_VIEW
+  if (handleCoverSwipe()) return true;
+#endif
 
   return false;
 }
@@ -985,8 +1013,15 @@ void LibraryListActivity::buildHeader(UiScreen& screen) {
     header.trailingIcon = fui::bitmapFromIcon(icon_search_32);
     header.trailingAction = ACTION_SEARCH;
     if (mappedInput.hasTouch()) {
+#if LIBRARY_COVER_VIEW
+      // The view toggle takes the refresh slot; refresh stays in the Recent
+      // row menu. The icon shows the view a tap switches to.
+      header.trailingAdjacentIcon = fui::bitmapFromIcon(coverView() ? icon_file_text_32 : icon_image_32);
+      header.trailingAdjacentAction = ACTION_TOGGLE_VIEW;
+#else
       header.trailingAdjacentIcon = fui::bitmapFromIcon(icon_refresh_cw_32);
       header.trailingAdjacentAction = ACTION_REBUILD;
+#endif
     }
     // Vertical placement comes from applyHeaderStatus: buttons center on the
     // unified band.
@@ -1026,6 +1061,12 @@ void LibraryListActivity::buildScreen(UiScreen& screen) {
     screen.centeredText(message);
     return;
   }
+#if LIBRARY_COVER_VIEW
+  if (coverView()) {
+    buildCoverGrid(screen);
+    return;
+  }
+#endif
   buildRows(screen);
 }
 
@@ -1084,6 +1125,11 @@ void LibraryListActivity::drawHoldHelp() const {
 void LibraryListActivity::render(RenderLock&& lock) {
   if (optionPopup.processRender(renderer, mappedInput)) return;
   UiTabListActivity::render(std::move(lock));
+#if LIBRARY_COVER_VIEW
+  // The page is on screen with placeholders; make its missing covers now and
+  // redraw. The render lock is still held (the base takes it by reference).
+  if (coverView() && bookRowCount() > 0) generateMissingCovers();
+#endif
 }
 
 void LibraryListActivity::drawFooter() {
@@ -1098,3 +1144,230 @@ void LibraryListActivity::drawFooter() {
                                             canSearch ? tr(STR_SEARCH) : tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
+
+bool LibraryListActivity::coverView() const {
+#if LIBRARY_COVER_VIEW
+  // An unsorted (degraded) index keeps the plain list: it has no tabs or
+  // header actions, so there would be no way back.
+  return SETTINGS.libraryCoverView != 0 && !degraded;
+#else
+  return false;
+#endif
+}
+
+#if LIBRARY_COVER_VIEW
+namespace {
+constexpr size_t MAX_FAILED_COVERS = 64;
+
+// Same cache directory the readers use (Epub / Xtc constructors), so a cover
+// made here is the one Home and the reader reuse, and the other way round.
+std::string coverThumbPathFor(const std::string& bookPath, const int height) {
+  const char* prefix = nullptr;
+  if (FsHelpers::hasReflowableBookExtension(bookPath)) {
+    prefix = "/.crosspoint/epub_";
+  } else if (FsHelpers::hasXtcExtension(bookPath)) {
+    prefix = "/.crosspoint/xtc_";
+  } else {
+    return {};
+  }
+  return std::string(prefix) + std::to_string(std::hash<std::string>{}(bookPath)) + "/thumb_" +
+         std::to_string(height) + ".bmp";
+}
+}  // namespace
+
+void LibraryListActivity::toggleViewActionTrampoline(const fui::ActionEvent&, void* user) {
+  static_cast<LibraryListActivity*>(user)->toggleCoverView();
+}
+
+void LibraryListActivity::toggleCoverView() {
+  app.clearTapFlash();
+  // Group headings have no cover form; leave the collapsed view first.
+  restoreExpandedList();
+  SETTINGS.libraryCoverView = SETTINGS.libraryCoverView != 0 ? 0 : 1;
+  SETTINGS.saveToFile();
+  // Keep the selected book and bring it into view in the new layout.
+  activeNav().followOnBuild = true;
+  requestUpdate(true);
+}
+
+bool LibraryListActivity::handleCoverSwipe() {
+  if (!coverView() || !mappedInput.hasTouch()) return false;
+  const auto swipe = mappedInput.wasSwipe();
+  if (swipe != MappedInputManager::SwipeDir::Up && swipe != MappedInputManager::SwipeDir::Down) return false;
+  const int count = listCount();
+  if (count <= 0) return true;
+  // Swipe up = next page, like turning a page. The selection moves with the
+  // page so buttons and the readout follow what is on screen.
+  const int page = std::max(1, activeNav().inputPageRows());
+  const int top = gridTopShown.load();
+  int next = swipe == MappedInputManager::SwipeDir::Up ? top + page : top - page;
+  if (next >= count) return true;
+  if (next < 0) {
+    if (top == 0) return true;
+    next = 0;
+  }
+  moveRingTo(next + 1);
+  return true;
+}
+
+bool LibraryListActivity::coverFailed(const std::string& path) const {
+  const size_t hash = std::hash<std::string>{}(path);
+  return std::find(failedCovers.begin(), failedCovers.end(), hash) != failedCovers.end();
+}
+
+void LibraryListActivity::refreshCoverSlots(const int top, const int cells) {
+  coverSlotsTop = top;
+  coverSlotsCount = cells;
+  const int count = listCount();
+  std::string path;
+  std::string author;
+  path.reserve(128);
+  author.reserve(64);
+  for (int i = 0; i < GRID_MAX_CELLS; i++) {
+    CoverSlot& slot = coverSlots[static_cast<size_t>(i)];
+    const int entry = top + i;
+    if (i >= cells || entry >= count || !bookPathFor(entry, path)) {
+      if (!slot.bookPath.empty()) {
+        slot = CoverSlot{};
+        coverCache.invalidate(static_cast<size_t>(i));
+      }
+      continue;
+    }
+    rowTextFor(entry, slot.title, author);
+    const std::string thumb = coverThumbPathFor(path, coverThumbHeight);
+    if (slot.bookPath == path && slot.thumbPath == thumb) continue;
+    slot.bookPath = path;
+    slot.thumbPath = thumb;
+    // Already tried once: placeholder, no second Loading popup.
+    slot.failed = !thumb.empty() && coverFailed(path);
+    slot.missing = !thumb.empty() && !slot.failed && !Storage.exists(thumb.c_str());
+    coverCache.invalidate(static_cast<size_t>(i));
+  }
+}
+
+bool LibraryListActivity::paintCover(fui::DrawTarget&, const fui::Rect rect, const uint16_t index) {
+  const int slot = static_cast<int>(index) - coverSlotsTop;
+  if (slot < 0 || slot >= GRID_MAX_CELLS) return false;
+  const CoverSlot& cover = coverSlots[static_cast<size_t>(slot)];
+  // A missing thumb paints the placeholder until generateMissingCovers runs.
+  static const std::string NO_COVER;
+  return coverCache.paint(rect, static_cast<size_t>(slot),
+                          cover.missing || cover.failed ? NO_COVER : cover.thumbPath);
+}
+
+void LibraryListActivity::buildCoverGrid(UiScreen& screen) {
+  if (!coverCacheReady) {
+    coverCache.begin();
+    coverCacheReady = true;
+  }
+  coverCache.prepare();
+  const auto& theme = screen.theme();
+  auto& nav = activeNav();
+  const int count = listCount();
+
+  fui::CoverGridProps grid;
+  grid.columns = GRID_COLUMNS;
+  grid.columnLayout = fui::CoverGridColumnLayout::SpaceBetween;
+  grid.titleText = theme.smallText;
+  grid.titleText.maxLines = 2;
+  grid.gap = theme.spaceSm;
+  grid.rowGap = theme.spaceSm;
+  grid.labelGap = 4;
+  // fitCoverGrid reserves 12px of width per cell for these side insets.
+  grid.cellInset = fui::Insets{4, 6, 0, 6};
+  const fui::Rect body = screen.body().inset(fui::Insets{0, SIDE_PADDING, 0, SIDE_PADDING});
+  if (!fui::fitCoverGrid(body, GRID_MAX_CELLS, screen.target().lineHeight(grid.titleText.font), body.height, grid)) {
+    return;
+  }
+  const int cells = std::max(
+      1, std::min<int>(GRID_MAX_CELLS, fui::coverGridVisibleCells(body, GRID_COLUMNS, grid.rowHeight, grid.rowGap)));
+
+  // Ring 0 is the tab strip; with it focused the page stays where it was.
+  int selected = ringPos() - 1;
+  if (selected >= count) selected = count - 1;
+  int top = selected >= 0 ? fui::coverGridTopIndexFor(static_cast<uint16_t>(selected), static_cast<uint16_t>(count),
+                                                      GRID_COLUMNS, static_cast<uint16_t>(cells))
+                          : nav.top / cells * cells;
+  if (top < 0 || top >= count) top = 0;
+  gridTopShown.store(top);
+  // Feed the page back to ListNav so held-button page jumps step by a page.
+  nav.visibleRows = cells;
+  nav.drawnCount = count;
+  nav.onListRendered(static_cast<uint16_t>(top), cells, true);
+
+  // Thumbs are made for the exact slot (+8 bleed, as on Home) so the dither is
+  // never rescaled.
+  coverThumbHeight = grid.coverSize.height + 8;
+  refreshCoverSlots(top, cells);
+
+  grid.count = static_cast<uint16_t>(count);
+  grid.topIndex = static_cast<uint16_t>(top);
+  grid.selectedIndex = static_cast<int16_t>(selected);
+  grid.action = ACTION_ROW;
+  grid.inputMask = fui::InputTouch | fui::InputLongPress;
+  grid.selectionIndicator = fui::CoverGridSelectionIndicator::CoverFrame;
+  grid.selectedCoverFrameGap = 3;
+  grid.selectedCoverFrameWidth = 3;
+  grid.cellStyles = theme.listRow;
+  grid.cellStyles.selected.border = fui::Paint::solid(fui::Color::Black);
+  // The "n/N books" readout already says where we are.
+  grid.scrollIndicator = false;
+  grid.itemProviderUserData = this;
+  grid.itemProvider = [](const uint16_t index, void* user) {
+    const auto& self = *static_cast<LibraryListActivity*>(user);
+    const int slot = static_cast<int>(index) - self.coverSlotsTop;
+    const char* title =
+        slot >= 0 && slot < GRID_MAX_CELLS ? self.coverSlots[static_cast<size_t>(slot)].title.c_str() : nullptr;
+    return fui::coverGridItem(title, index);
+  };
+  grid.coverPainterUserData = this;
+  grid.coverPainter = [](fui::DrawTarget& target, const fui::Rect rect, const fui::CoverGridItem&,
+                         const uint16_t index, void* user) {
+    return static_cast<LibraryListActivity*>(user)->paintCover(target, rect, index);
+  };
+  fui::coverGrid(screen.frame(), body, grid);
+}
+
+void LibraryListActivity::generateMissingCovers() {
+  int total = 0;
+  for (int i = 0; i < coverSlotsCount; i++) {
+    if (coverSlots[static_cast<size_t>(i)].missing) total++;
+  }
+  if (total == 0) return;
+
+  // The parsers open the book and write the thumb; give them the card.
+  index.close();
+  const Rect popup = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  GUI.fillPopupProgress(renderer, popup, 0);
+  int done = 0;
+  for (int i = 0; i < coverSlotsCount; i++) {
+    CoverSlot& slot = coverSlots[static_cast<size_t>(i)];
+    if (!slot.missing) continue;
+    bool made = false;
+    // One parser at a time, on the heap: both exceed the stack budget.
+    if (FsHelpers::hasReflowableBookExtension(slot.bookPath)) {
+      auto epub = makeUniqueNoThrow<Epub>(slot.bookPath, "/.crosspoint");
+      made = epub && epub->generateThumbBmpFromSource(coverThumbHeight);
+    } else if (FsHelpers::hasXtcExtension(slot.bookPath)) {
+      auto xtc = makeUniqueNoThrow<Xtc>(slot.bookPath, "/.crosspoint");
+      made = xtc && xtc->load() && xtc->generateThumbBmp(coverThumbHeight);
+    }
+    made = made && Storage.exists(slot.thumbPath.c_str());
+    if (!made) {
+      LOG_ERR("LIB", "no cover for %s", slot.bookPath.c_str());
+      // Placeholder from now on; remembered so revisiting the page does not
+      // pop the Loading dialog for this book again.
+      slot.failed = true;
+      if (failedCovers.size() < MAX_FAILED_COVERS) {
+        if (failedCovers.capacity() == 0) failedCovers.reserve(MAX_FAILED_COVERS);
+        failedCovers.push_back(std::hash<std::string>{}(slot.bookPath));
+      }
+    }
+    slot.missing = false;
+    coverCache.invalidate(static_cast<size_t>(i));
+    GUI.fillPopupProgress(renderer, popup, ++done * 100 / total);
+  }
+  if (!index.open(library::libraryIndexPath())) LOG_ERR("LIB", "cannot reopen library index");
+  requestUpdate();
+}
+#endif

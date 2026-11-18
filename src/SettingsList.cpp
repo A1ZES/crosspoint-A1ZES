@@ -237,6 +237,11 @@ void forEachBaseSetting(SettingVisitor visit, void* context) {
   emit(SettingInfo::Value(StrId::STR_WARMTH, &CrossPointSettings::frontlightWarmth, {0, 100, 5}, "frontlightWarmth"));
 #endif
   emit(SettingInfo::Toggle(StrId::STR_FRONTLIGHT, &CrossPointSettings::frontlightOn, "frontlightOn"));
+#if FREEINK_DEVICE_X4PRO
+  // Library list/cover view: persisted, category-less because the Library
+  // header's view toggle owns it.
+  emit(SettingInfo::Toggle(StrId::STR_LIBRARY_COVER_VIEW, &CrossPointSettings::libraryCoverView, "libraryCoverView"));
+#endif
 
   // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---
   emit(SettingInfo::DynamicString(
