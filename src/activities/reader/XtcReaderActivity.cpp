@@ -163,7 +163,9 @@ void XtcReaderActivity::renderPage() {
     return;
   }
 
+  const uint32_t tStart = millis();  // TIMING-DIAG
   size_t bytesRead = xtc->loadPage(currentPage, pageBuffer, pageBufferSize);
+  const uint32_t tLoaded = millis();  // TIMING-DIAG
   if (bytesRead == 0) {
     LOG_ERR("XTR", "Failed to load page %lu: bufferSize=%lu bitDepth=%u error=%s", currentPage, pageBufferSize,
             bitDepth, xtc::errorToString(xtc->getLastError()));
@@ -202,6 +204,7 @@ void XtcReaderActivity::renderPage() {
       }
     }
 
+    const uint32_t tBwDrawn = millis();  // TIMING-DIAG
     if (pagesUntilFullRefresh <= 1) {
       // Periodic ghost cleanup: scrub via the normal path, then run the
       // settle flavor of the grayscale base pass (DTM planes are equal after
@@ -220,6 +223,7 @@ void XtcReaderActivity::renderPage() {
       pagesUntilFullRefresh--;
     }
 
+    const uint32_t tBase = millis();  // TIMING-DIAG
     renderer.clearScreen(0x00);
     for (uint16_t y = 0; y < pageHeight; y++) {
       for (uint16_t x = 0; x < pageWidth; x++) {
@@ -241,7 +245,9 @@ void XtcReaderActivity::renderPage() {
     }
     renderer.copyGrayscaleMsbBuffers();
 
+    const uint32_t tPlanes = millis();  // TIMING-DIAG
     renderer.displayGrayBuffer();
+    const uint32_t tGray = millis();  // TIMING-DIAG
 
     renderer.clearScreen();
     for (uint16_t y = 0; y < pageHeight; y++) {
@@ -253,6 +259,10 @@ void XtcReaderActivity::renderPage() {
     }
 
     renderer.cleanupGrayscaleWithFrameBuffer();
+    const uint32_t tEnd = millis();  // TIMING-DIAG
+    LOG_INF("XTR", "TIMING xtch page %lu: load=%lu bwDraw=%lu baseRefresh=%lu planes=%lu grayRefresh=%lu cleanup=%lu total=%lu ms",  // TIMING-DIAG
+            currentPage + 1, tLoaded - tStart, tBwDrawn - tLoaded, tBase - tBwDrawn, tPlanes - tBase, tGray - tPlanes,  // TIMING-DIAG
+            tEnd - tGray, tEnd - tStart);  // TIMING-DIAG
 
     free(pageBuffer);
 
